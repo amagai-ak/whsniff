@@ -80,7 +80,51 @@ typedef struct usb_tick_header
 	uint8_t tick;				// tick counter
 } usb_tick_header_type;
 
-#pragma pack(pop)
+
+// see https://github.com/jkcko/ieee802.15.4-tap/blob/master/IEEE%20802.15.4%20TAP%20Link%20Type%20Specification.pdf
+typedef struct pcap_802_15_4_tap_hdr
+{
+	uint8_t ver;				// version
+	uint8_t pad;				// padding
+	uint16_t len;				// total length of tap
+} pcap_802_15_4_tap_hdr_t;
+
+typedef struct pcap_802_15_4_tap_fcstype
+{
+	uint16_t type;				// 1
+	uint16_t len;				// 4
+	uint8_t fcstype;			// 0:None, 1:16bitCRC, 2:32bitCRC
+	uint8_t pad[3];			
+} pcap_802_15_4_tap_fcstype_t;
+
+typedef struct pcap_802_15_4_tap_rssi
+{
+	uint16_t type;				// 1
+	uint16_t len;				// 4
+	float rssi;					// RSS in dBm (IEEE-754 float)
+} pcap_802_15_4_tap_rssi_t;
+
+typedef struct pcap_802_15_4_tap_centerfreq
+{
+	uint16_t type;				// 11
+	uint16_t len;				// 4
+	float freq;					// center frequency in kHz (IEEE-754 float)
+} pcap_802_15_4_tap_centerfreq_t;
+
+
+// overall structure of tap
+typedef struct pcap_802_15_4_tap
+{
+	pcap_802_15_4_tap_hdr_t hdr;
+	pcap_802_15_4_tap_fcstype_t fcstype;
+	pcap_802_15_4_tap_rssi_t rssi;
+	pcap_802_15_4_tap_centerfreq_t cf;
+} pcap_802_15_4_tap_t;
+
+
+// Link type : http://www.tcpdump.org/linktypes.html
+// 195 LINKTYPE_IEEE802_15_4_WITHFCS
+// 283 LINKTYPE_IEEE802_15_4_TAP
 
 static const pcap_hdr_t pcap_hdr = {
 	.magic_number = 0xA1B2C3D4,	// native byte ordering
@@ -88,11 +132,27 @@ static const pcap_hdr_t pcap_hdr = {
 	.version_minor = 4,
 	.thiszone = 0,				// GMT
 	.sigfigs = 0,				// zero value for sig figs as standard
-	.snaplen = 128,				// max 802.15.4 packet length
-	.network = 195				// IEEE 802.15.4
+	.snaplen = 128 + sizeof(pcap_802_15_4_tap_t),	// max 802.15.4 packet length + tap
+	.network = 283				// IEEE 802.15.4 TAP
 };
 
+
+#pragma pack(pop)
+
+
 static volatile unsigned int signal_exit = 0;
+
+// command line option
+typedef struct prog_option_s
+{
+	int channel;				// channel
+	int discard_errframe;		// discard FCS error frame
+} prog_option_t;
+
+static prog_option_t prog_opt = {
+	.channel = 0,
+	.discard_errframe = 0
+};
 
 //--------------------------------------------
 static uint16_t update_crc_ccitt(uint16_t crc, uint8_t c);
@@ -115,6 +175,9 @@ static int packet_handler(unsigned char *buf, int cnt)
 	uint64_t timestamp_us;
 	uint16_t fcs;
 	uint16_t le_fcs;
+	int rssi;
+
+	pcap_802_15_4_tap_t tap;
 
 	if (sizeof(usb_header_type) > cnt)
 		return -1;
@@ -158,11 +221,8 @@ static int packet_handler(unsigned char *buf, int cnt)
 			pcaprec_hdr.ts_sec = (uint32_t)(timestamp_us / 1000000);
 			pcaprec_hdr.ts_usec = (uint32_t)(timestamp_us - (uint64_t)(pcaprec_hdr.ts_sec) * 1000000);
 			pcaprec_hdr.ts_sec += (uint32_t)timestamp_epoch;
-			pcaprec_hdr.incl_len = (uint32_t)usb_data_header->wpan_len;
-			pcaprec_hdr.orig_len = (uint32_t)usb_data_header->wpan_len;
-
-			fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, stdout);
-			fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, stdout);
+			pcaprec_hdr.incl_len = (uint32_t)usb_data_header->wpan_len + sizeof(tap);
+			pcaprec_hdr.orig_len = (uint32_t)usb_data_header->wpan_len + sizeof(tap);
 
 			// SmartRF™ Packet Sniffer User’s Manual (SWRU187G)
 			// FCS:
@@ -171,15 +231,49 @@ static int packet_handler(unsigned char *buf, int cnt)
 			// BYTE 2: Bit 7: Indicate CRC OK or not.
 			// Bit 6-0: If Correlation used: Correlation value.
 			// If Correlation not used: LQI.
-
-			fcs = 0;
 			if (buf[sizeof(usb_data_header_type) + usb_data_header->wpan_len - 1] & 0x80)
 			{
 				// CRC OK
 				fcs = ieee802154_crc16((uint8_t *)&buf[sizeof(usb_data_header_type)], 0, usb_data_header->wpan_len - 2);
+
+				// get RSSI: 2'complement, with offset
+				rssi = (int8_t)buf[sizeof(usb_data_header_type) + usb_data_header->wpan_len - 2];
+				rssi = rssi - 73;	// remove offset
+			}
+			else
+			{	// FCS Error
+				if (prog_opt.discard_errframe)
+					break;
+				fcs = 0;
+				rssi = -127;
 			}
 			le_fcs = htole16(fcs);
 
+			tap.hdr.ver = 0;
+			tap.hdr.pad = 0;
+			tap.hdr.len = sizeof(tap);
+			tap.fcstype.type = 0;
+			tap.fcstype.len = 4;
+			tap.fcstype.fcstype = 1;
+			tap.rssi.type = 1;
+			tap.rssi.len = 4;
+			tap.rssi.rssi = (float)rssi;
+			tap.cf.type = 11;
+			tap.cf.len = 4;
+			// 802.15.4: ch11=2.405GHz, Channel spacing=5MHz
+			tap.cf.freq = 1000.0 * (2405.0 + 5.0 * (float)(prog_opt.channel - 11));	// in kHz;
+
+			// generate output
+			// Header
+			fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, stdout);
+
+			// tap 
+			fwrite(&tap, sizeof(tap), 1, stdout);
+
+			// body
+			fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, stdout);
+
+			// FCS
 			fwrite(&le_fcs, sizeof(le_fcs), 1, stdout);
 			fflush(stdout);
 
@@ -209,7 +303,9 @@ void signal_handler(int sig)
 //--------------------------------------------
 void print_usage()
 {
-    printf("Usage: whsniff -c channel\n");
+    fprintf(stderr, "Usage: whsniff <-c channel> [-e]\n");
+    fprintf(stderr, "-c channel: channe=11..26\n");
+    fprintf(stderr, "-e        : discard FCS error frame\n");
 }
 
 //--------------------------------------------
@@ -232,35 +328,42 @@ int main(int argc, char *argv[])
 	// pipe closed
 	signal(SIGPIPE, signal_handler);
 
-	if (argc != 3)
-	{
-		print_usage();
-		exit(EXIT_FAILURE);
-	}
-
+	channel = 0;
 	option = 0;
-	while ((option = getopt(argc, argv, "c:")) != -1)
+	while ((option = getopt(argc, argv, "ec:")) != -1)
 	{
 		switch (option)
 		{
+			case 'e':
+				prog_opt.discard_errframe = 1;
+				break;
+
 			case 'c':
 				channel = (uint8_t)atoi(optarg);
 				if (channel < 11 || channel > 26)
 				{
-					printf("ERROR: Invalid 802.15.4 channel. Must be in range 11 to 26.\n");
+					fprintf(stderr, "ERROR: Invalid 802.15.4 channel. Must be in range 11 to 26.\n");
 					exit(EXIT_FAILURE);
 				}
+				prog_opt.channel = channel;
 				break;
+
 			default:
 				print_usage();
 				exit(EXIT_FAILURE);
 		}
 	}
 
+	if(prog_opt.channel == 0){
+		fprintf(stderr, "ERROR: Channel must be specified\n");
+		print_usage();
+		exit(EXIT_FAILURE);
+	}
+
 	res = libusb_init(NULL);
 	if (res < 0)
 	{
-		printf("ERROR: Could not initialize libusb.\n");
+		fprintf(stderr, "ERROR: Could not initialize libusb.\n");
 		exit(EXIT_FAILURE);
 	}
 #if LIBUSB_API_VERSION >= 0x01000106
@@ -323,7 +426,7 @@ int main(int argc, char *argv[])
 	libusb_free_device_list(list, count);
 	if(!found_device)
 	{
-		printf("ERROR: No working device found.\n");
+		fprintf(stderr, "ERROR: No working device found.\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -362,7 +465,7 @@ int main(int argc, char *argv[])
 		if (usb_cnt + recv_cnt > 2 * BUF_SIZE)
 		{
 			// overflow error
-			printf("%s\n", "ERROR: Buffer overflow.\n");
+			fprintf(stderr, "%s\n", "ERROR: Buffer overflow.\n");
 			break;
 		}
 		if (res < 0)
@@ -370,7 +473,7 @@ int main(int argc, char *argv[])
 			if (res == LIBUSB_ERROR_TIMEOUT)
 				continue;
 			// libusb error
-			printf("ERROR: %s.\n", libusb_error_name(res));
+			fprintf(stderr, "ERROR: %s.\n", libusb_error_name(res));
 			break;
 		}
 
