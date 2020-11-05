@@ -126,14 +126,18 @@ typedef struct pcap_802_15_4_tap
 // 195 LINKTYPE_IEEE802_15_4_WITHFCS
 // 283 LINKTYPE_IEEE802_15_4_TAP
 
-static const pcap_hdr_t pcap_hdr = {
+#define LINKTYPE_IEEE802_15_4_WITHFCS 195
+#define LINKTYPE_IEEE802_15_4_TAP 283
+#define PKTLEN_802_15_4 128
+
+static pcap_hdr_t pcap_hdr = {
 	.magic_number = 0xA1B2C3D4,	// native byte ordering
 	.version_major = 2,			// current version is 2.4
 	.version_minor = 4,
 	.thiszone = 0,				// GMT
 	.sigfigs = 0,				// zero value for sig figs as standard
-	.snaplen = 128 + sizeof(pcap_802_15_4_tap_t),	// max 802.15.4 packet length + tap
-	.network = 283				// IEEE 802.15.4 TAP
+	.snaplen = PKTLEN_802_15_4,	// max 802.15.4 packet length( + tap)
+	.network = LINKTYPE_IEEE802_15_4_WITHFCS			// IEEE 802.15.4 FCS
 };
 
 
@@ -147,11 +151,13 @@ typedef struct prog_option_s
 {
 	int channel;				// channel
 	int discard_errframe;		// discard FCS error frame
+	int tap_support;			// TAP support
 } prog_option_t;
 
 static prog_option_t prog_opt = {
 	.channel = 0,
-	.discard_errframe = 0
+	.discard_errframe = 0,
+	.tap_support = 0
 };
 
 //--------------------------------------------
@@ -221,9 +227,17 @@ static int packet_handler(unsigned char *buf, int cnt)
 			pcaprec_hdr.ts_sec = (uint32_t)(timestamp_us / 1000000);
 			pcaprec_hdr.ts_usec = (uint32_t)(timestamp_us - (uint64_t)(pcaprec_hdr.ts_sec) * 1000000);
 			pcaprec_hdr.ts_sec += (uint32_t)timestamp_epoch;
-			pcaprec_hdr.incl_len = (uint32_t)usb_data_header->wpan_len + sizeof(tap);
-			pcaprec_hdr.orig_len = (uint32_t)usb_data_header->wpan_len + sizeof(tap);
-
+			if( prog_opt.tap_support )
+			{
+				pcaprec_hdr.incl_len = (uint32_t)usb_data_header->wpan_len + sizeof(tap);
+				pcaprec_hdr.orig_len = (uint32_t)usb_data_header->wpan_len + sizeof(tap);
+			}
+			else
+			{
+				pcaprec_hdr.incl_len = (uint32_t)usb_data_header->wpan_len;
+				pcaprec_hdr.orig_len = (uint32_t)usb_data_header->wpan_len;
+			}
+			
 			// SmartRF™ Packet Sniffer User’s Manual (SWRU187G)
 			// FCS:
 			// The checksum of the frame has been replaced by the radio chip in the following way:
@@ -249,26 +263,28 @@ static int packet_handler(unsigned char *buf, int cnt)
 			}
 			le_fcs = htole16(fcs);
 
-			tap.hdr.ver = 0;
-			tap.hdr.pad = 0;
-			tap.hdr.len = sizeof(tap);
-			tap.fcstype.type = 0;
-			tap.fcstype.len = 4;
-			tap.fcstype.fcstype = 1;
-			tap.rssi.type = 1;
-			tap.rssi.len = 4;
-			tap.rssi.rssi = (float)rssi;
-			tap.cf.type = 11;
-			tap.cf.len = 4;
-			// 802.15.4: ch11=2.405GHz, Channel spacing=5MHz
-			tap.cf.freq = 1000.0 * (2405.0 + 5.0 * (float)(prog_opt.channel - 11));	// in kHz;
-
 			// generate output
 			// Header
 			fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, stdout);
 
-			// tap 
-			fwrite(&tap, sizeof(tap), 1, stdout);
+			if( prog_opt.tap_support )
+			{
+				tap.hdr.ver = 0;
+				tap.hdr.pad = 0;
+				tap.hdr.len = sizeof(tap);
+				tap.fcstype.type = 0;
+				tap.fcstype.len = 4;
+				tap.fcstype.fcstype = 1;
+				tap.rssi.type = 1;
+				tap.rssi.len = 4;
+				tap.rssi.rssi = (float)rssi;
+				tap.cf.type = 11;
+				tap.cf.len = 4;
+				// 802.15.4: ch11=2.405GHz, Channel spacing=5MHz
+				tap.cf.freq = 1000.0 * (2405.0 + 5.0 * (float)(prog_opt.channel - 11));	// in kHz;
+				// tap 
+				fwrite(&tap, sizeof(tap), 1, stdout);
+			}
 
 			// body
 			fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, stdout);
@@ -306,6 +322,7 @@ void print_usage()
     fprintf(stderr, "Usage: whsniff <-c channel> [-e]\n");
     fprintf(stderr, "-c channel: channe=11..26\n");
     fprintf(stderr, "-e        : discard FCS error frame\n");
+    fprintf(stderr, "-t        : add TAP header\n");
 }
 
 //--------------------------------------------
@@ -330,12 +347,16 @@ int main(int argc, char *argv[])
 
 	channel = 0;
 	option = 0;
-	while ((option = getopt(argc, argv, "ec:")) != -1)
+	while ((option = getopt(argc, argv, "tec:")) != -1)
 	{
 		switch (option)
 		{
 			case 'e':
 				prog_opt.discard_errframe = 1;
+				break;
+
+			case 't':
+				prog_opt.tap_support = 1;
 				break;
 
 			case 'c':
@@ -358,6 +379,12 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "ERROR: Channel must be specified\n");
 		print_usage();
 		exit(EXIT_FAILURE);
+	}
+
+	if( prog_opt.tap_support )
+	{
+		pcap_hdr.snaplen += sizeof(pcap_802_15_4_tap_t);
+		pcap_hdr.network = LINKTYPE_IEEE802_15_4_TAP;
 	}
 
 	res = libusb_init(NULL);
