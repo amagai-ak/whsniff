@@ -152,13 +152,11 @@ typedef struct prog_option_s
 	int channel;				// channel
 	int discard_errframe;		// discard FCS error frame
 	int tap_support;			// TAP support
+	int verbose;				// verbose messages
+	FILE *outfile;				// output file ptr
 } prog_option_t;
 
-static prog_option_t prog_opt = {
-	.channel = 0,
-	.discard_errframe = 0,
-	.tap_support = 0
-};
+static prog_option_t prog_opt;
 
 //--------------------------------------------
 static uint16_t update_crc_ccitt(uint16_t crc, uint8_t c);
@@ -259,13 +257,13 @@ static int packet_handler(unsigned char *buf, int cnt)
 				if (prog_opt.discard_errframe)
 					break;
 				fcs = 0;
-				rssi = -127;
+				rssi = -128 -73;	// -128 = minimum RSSI value (invalid)
 			}
 			le_fcs = htole16(fcs);
 
 			// generate output
 			// Header
-			fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, stdout);
+			fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, prog_opt.outfile);
 
 			if( prog_opt.tap_support )
 			{
@@ -283,15 +281,15 @@ static int packet_handler(unsigned char *buf, int cnt)
 				// 802.15.4: ch11=2.405GHz, Channel spacing=5MHz
 				tap.cf.freq = 1000.0 * (2405.0 + 5.0 * (float)(prog_opt.channel - 11));	// in kHz;
 				// tap 
-				fwrite(&tap, sizeof(tap), 1, stdout);
+				fwrite(&tap, sizeof(tap), 1, prog_opt.outfile);
 			}
 
 			// body
-			fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, stdout);
+			fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, prog_opt.outfile);
 
 			// FCS
-			fwrite(&le_fcs, sizeof(le_fcs), 1, stdout);
-			fflush(stdout);
+			fwrite(&le_fcs, sizeof(le_fcs), 1, prog_opt.outfile);
+			fflush(prog_opt.outfile);
 
 			break;
 
@@ -319,10 +317,12 @@ void signal_handler(int sig)
 //--------------------------------------------
 void print_usage()
 {
-    fprintf(stderr, "Usage: whsniff <-c channel> [-e]\n");
+    fprintf(stderr, "Usage: whsniff <-c channel> [-e] [-t] [-o file]\n");
     fprintf(stderr, "-c channel: channe=11..26\n");
     fprintf(stderr, "-e        : discard FCS error frame\n");
     fprintf(stderr, "-t        : add TAP header\n");
+    fprintf(stderr, "-v        : verbose messages\n");
+    fprintf(stderr, "-o file   : write output to file instead of stdout\n");
 }
 
 //--------------------------------------------
@@ -337,6 +337,7 @@ int main(int argc, char *argv[])
 	static int usb_cnt;
 	static unsigned char recv_buf[2 * BUF_SIZE];
 	static int recv_cnt;
+	FILE *fp;
 
 	// ctrl-c
 	signal(SIGINT, signal_handler);
@@ -347,7 +348,15 @@ int main(int argc, char *argv[])
 
 	channel = 0;
 	option = 0;
-	while ((option = getopt(argc, argv, "tec:")) != -1)
+
+	// initialize program (global) option
+	prog_opt.channel = 0;
+	prog_opt.discard_errframe = 0;
+	prog_opt.tap_support = 0;
+	prog_opt.verbose = 0;
+	prog_opt.outfile = stdout;
+
+	while ((option = getopt(argc, argv, "vtec:o:")) != -1)
 	{
 		switch (option)
 		{
@@ -357,6 +366,20 @@ int main(int argc, char *argv[])
 
 			case 't':
 				prog_opt.tap_support = 1;
+				break;
+			
+			case 'v':
+				prog_opt.verbose = 1;
+				break;
+
+			case 'o':
+				fp = fopen( optarg, "w");
+				if( fp == NULL )
+				{
+					fprintf(stderr, "Failed to create output file\n");
+					exit(EXIT_FAILURE);
+				}
+				prog_opt.outfile = fp;
 				break;
 
 			case 'c':
@@ -409,10 +432,14 @@ int main(int argc, char *argv[])
 		libusb_get_device_descriptor(device, &t_desc);
 		if(t_desc.idVendor == 0x0451 && t_desc.idProduct == 0x16ae)
 		{
-			// printf("Found device %04x:%04x (bcdDevice: %04x)\n", t_desc.idVendor, t_desc.idProduct, t_desc.bcdDevice);
+			if( prog_opt.verbose ){
+				fprintf(stderr, "Found device %04x:%04x (bcdDevice: %04x)\n", t_desc.idVendor, t_desc.idProduct, t_desc.bcdDevice);
+			}
+
 			if(libusb_open(device, &handle) != 0)
 			{
-				fprintf(stderr, "--> unable to open device.\n");
+				if( prog_opt.verbose )
+					fprintf(stderr, "--> unable to open device.\n");
 				continue;
 			}
 			if (handle == NULL)
@@ -435,14 +462,16 @@ int main(int argc, char *argv[])
 			res = libusb_set_configuration(handle, 1);
 			if (res < 0)
 			{
-				fprintf(stderr, "--> unable to set configuration for device.\n");
+				if( prog_opt.verbose )
+					fprintf(stderr, "--> unable to set configuration for device.\n");
 				libusb_close(handle);
 				continue;
 			}
 			res = libusb_claim_interface(handle, 0);
 			if (res < 0)
 			{
-				fprintf(stderr, "--> unable to claim interface for device.\n");
+				if( prog_opt.verbose )
+					fprintf(stderr, "--> unable to claim interface for device.\n");
 				libusb_close(handle);
 				continue;
 			}
@@ -482,8 +511,8 @@ int main(int argc, char *argv[])
 	// start sniffing
 	res = libusb_control_transfer(handle, 0x40, 208, 0, 0, NULL, 0, TIMEOUT);
 
-	fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, stdout);
-	fflush(stdout);
+	fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, prog_opt.outfile);
+	fflush(prog_opt.outfile);
 
 	while (!signal_exit)
 	{
@@ -530,6 +559,8 @@ int main(int argc, char *argv[])
 	libusb_close(handle);
 	libusb_exit(NULL);
 
+
+	fclose( prog_opt.outfile );
 	exit(EXIT_SUCCESS);
 }
 
